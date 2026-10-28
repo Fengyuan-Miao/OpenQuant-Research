@@ -52,3 +52,8 @@ node_modules/
 ./pretrain
 .idea/
 .aider*
+.venv/
+.qlib_workbench/
+/db
+/temp
+/tests

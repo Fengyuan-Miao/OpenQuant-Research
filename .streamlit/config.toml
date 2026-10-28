@@ -1,0 +1,10 @@
+[server]
+address = "0.0.0.0"
+port = 31209
+
+[theme]
+base = "light"
+primaryColor = "#2563eb"
+backgroundColor = "#f7f9fc"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#172b4d"
