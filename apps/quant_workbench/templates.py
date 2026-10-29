@@ -1,54 +1,25 @@
-TEMPLATES = {
-    "买入持有": '''def initialize(context):
-    context.bought = False
+"""Standalone annotated strategies, loaded as source for the trusted-code editor."""
+from pathlib import Path
 
-def handle_data(context, data):
-    if not context.bought:
-        for stock in context.universe:
-            if stock in data:
-                order_target_percent(stock, 0.95 / len(context.universe))
-        context.bought = True
-    record(总资产=context.portfolio.total_value)
-''',
-    "双均线": '''def initialize(context):
-    context.fast = int(context.params.get("fast", 5))
-    context.slow = int(context.params.get("slow", 20))
+STRATEGY_DIR = Path(__file__).with_name("strategies")
+TEMPLATE_FILES = {
+    "买入持有": "buy_and_hold.py",
+    "双均线": "moving_average.py",
+    "动量轮动": "momentum.py",
+    "短期反转": "reversal.py",
+    "布林带均值回归": "bollinger.py",
+    "唐奇安通道突破": "donchian.py",
+}
+TEMPLATES = {name: (STRATEGY_DIR / file).read_text(encoding="utf-8")
+             for name, file in TEMPLATE_FILES.items()}
 
-def handle_data(context, data):
-    prices = history(context.slow, "close")
-    for stock in context.universe:
-        try:
-            close = prices.xs(stock, level="instrument")["close"]
-        except KeyError:
-            continue
-        if len(close) < context.slow:
-            continue
-        fast, slow = close.tail(context.fast).mean(), close.mean()
-        weight = 0.95 / len(context.universe) if fast > slow else 0
-        order_target_percent(stock, weight)
-    record(总资产=context.portfolio.total_value)
-''',
-    "动量轮动": '''def initialize(context):
-    context.lookback = int(context.params.get("lookback", 20))
-    context.step = 0
-
-def handle_data(context, data):
-    context.step += 1
-    if context.step % 5 != 1:
-        return
-    prices = history(context.lookback + 1, "close")
-    scores = {}
-    for stock, group in prices.groupby(level="instrument"):
-        if len(group) >= context.lookback + 1 and stock in data:
-            scores[stock] = group.close.iloc[-1] / group.close.iloc[0] - 1
-    if not scores:
-        return
-    winner = max(scores, key=scores.get)
-    for stock in context.universe:
-        order_target_percent(stock, 0.95 if stock == winner else 0)
-    log.info("本期选择 %s，动量 %.2f%%", winner, scores[winner] * 100)
-    record(总资产=context.portfolio.total_value)
-'''
+TEMPLATE_LESSONS = {
+    "买入持有": "第 1 课：一次等权建仓，理解 context、股票池和目标仓位。未成交部分不自动补单。",
+    "双均线": "第 2 课：短均线高于长均线时持有，否则清仓。学习 history、groupby 和均值；震荡时可能反复交易。",
+    "动量轮动": "第 3 课：定期买过去涨幅最高的股票。学习评分和排名；全部下跌时也会选相对强者。",
+    "短期反转": "第 4 课：定期买过去收益最低的股票。与动量比较排名方向；持续下跌时反转可能不出现。",
+    "布林带均值回归": "第 5 课：教学规则为跌破下轨持有、回到中轨退出。学习标准差和状态；下轨不保证反弹。",
+    "唐奇安通道突破": "第 6 课：突破此前最高价持有、跌破此前最低价退出。学习窗口排除当前观察值；不包含完整海龟系统。",
 }
 
 API_HELP = '''

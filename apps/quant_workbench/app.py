@@ -17,7 +17,7 @@ from streamlit_ace import st_ace
 
 from apps.quant_workbench.data import scan, freeze_manifest, symbol
 from apps.quant_workbench.store import Store, LABELS, ACTIVE, validate
-from apps.quant_workbench.templates import TEMPLATES, API_HELP, ASSUMPTIONS
+from apps.quant_workbench.templates import TEMPLATES, TEMPLATE_LESSONS, API_HELP, ASSUMPTIONS
 
 st.set_page_config(page_title="Qlib 策略工作台", page_icon="📈", layout="wide")
 st.markdown("""<style>
@@ -37,6 +37,9 @@ TABLE_LABELS = {
     "cost": "费用", "total_cost": "累计费用（元）", "turnover": "换手率",
     "total_turnover": "累计成交额（元）", "benchmark_nav": "基准净值",
     "benchmark_daily_return": "基准日收益率",
+    "hold_nav": "买入持有净值（扣费）", "hold_drawdown": "买入持有回撤",
+    "hold_daily_return": "买入持有日收益率（扣费）",
+    "hold_return_difference": "策略与买入持有累计收益差",
 }
 
 
@@ -50,7 +53,7 @@ def navigate(page, strategy_id=None, run_id=None):
 
 
 def catalog(refresh=False):
-    path = st.session_state.get("data_path", os.environ.get("QLIB_WORKBENCH_DATA", str(ROOT / "db/data/market_daily")))
+    path = st.session_state.get("data_path", os.environ.get("QLIB_WORKBENCH_DATA", str(ROOT / "data/market_daily")))
     if refresh or "catalog" not in st.session_state or st.session_state.catalog["directory"] != str(Path(path).expanduser().resolve()):
         with st.spinner("正在扫描已完成的行情文件…"):
             st.session_state.catalog = scan(path)
@@ -65,10 +68,11 @@ def strategies_page():
     st.title("我的策略")
     st.caption("从一个想法开始，编写策略，用历史数据验证。")
     with st.expander("＋ 新建策略", expanded=not store.strategies()):
+        template = st.selectbox("策略模板", list(TEMPLATES))
+        st.info(TEMPLATE_LESSONS[template])
+        st.caption("教学示例均只做多，使用昨日及更早数据，今日开盘撮合；参数说明在代码顶部。")
         with st.form("create_strategy"):
-            cols = st.columns([2, 1])
-            name = cols[0].text_input("策略名称", value="我的新策略")
-            template = cols[1].selectbox("策略模板", list(TEMPLATES))
+            name = st.text_input("策略名称", value="我的新策略")
             if st.form_submit_button("创建并编辑", type="primary"):
                 try:
                     strategy_id = store.save_strategy(name, TEMPLATES[template])
@@ -167,6 +171,7 @@ def editor_page():
         universe = st.text_area("股票池", value=", ".join(defaults.get("symbols", preferred)),
                                 help="用逗号、空格或换行分隔。支持 SZ000001、000001.SZ、000001.XSHE。", key="cfg_symbols")
         benchmark = st.text_input("基准代码（可留空）", value=defaults.get("benchmark") or "", key="cfg_benchmark")
+        st.caption("自动对比股票池的买入持有收益；这里可另外指定市场基准。")
         with st.expander("交易费用与策略参数"):
             buy = st.number_input("买入费率", min_value=0.0, max_value=0.99, value=float(defaults.get("open_cost", 0.0005)), format="%.5f", key="cfg_buy")
             sell = st.number_input("卖出费率", min_value=0.0, max_value=0.99, value=float(defaults.get("close_cost", 0.0015)), format="%.5f", key="cfg_sell")
@@ -238,16 +243,35 @@ def run_view(run_id):
             col.metric(label, "不可计算" if value is None else (f"{value:.2f}" if key == "sharpe" else f"{value:.2%}"))
         if "benchmark_return" in stats:
             st.caption(f"基准收益 {stats['benchmark_return']:.2%} · 超额收益 {stats['excess_return']:.2%}（策略减基准）")
+        hold_label = "标的买入持有" if len(config["symbols"]) == 1 else "股票池初始等权买入持有"
+        if "hold_metrics" in stats:
+            hold_stats = stats["hold_metrics"]
+            comparison = st.columns(3)
+            comparison[0].metric(hold_label + "收益", f"{hold_stats['total_return']:.2%}")
+            comparison[1].metric("策略 − 买入持有", f"{stats['hold_return_difference'] * 100:+.2f} 个百分点")
+            comparison[2].metric("买入持有最大回撤", f"{hold_stats['max_drawdown']:.2%}")
+            st.caption("对照使用相同初始资金、日期、行情快照和手续费。首日向每只标的提交 1/N 的目标仓位，"
+                       "之后不调仓；按昨日价格估算数量、当日开盘撮合。整数手、资金不足、停牌或缺行情可能使实际仓位偏离等权，"
+                       "未成交不补单，余额留现金；期末按收盘估值，不强制卖出。")
+            st.caption("收益差是两者累计收益率相减，不是风险调整后的 Alpha。策略仓位较低时，"
+                       "应同时比较回撤；一次回测跑赢不能证明策略持续有效。")
+        else:
+            st.info("这条历史记录尚未保存买入持有对照；在回测历史中复制配置并重新运行即可生成。")
         report = pd.read_parquet(folder / "report.parquet").drop(columns=["bench"], errors="ignore")
         # Plot the initial cash point as well, so first-day losses are visible.
         initial = {"datetime": pd.Timestamp(config["start"]) - pd.Timedelta(days=1), "nav": 1, "drawdown": 0}
         if "benchmark_nav" in report:
             initial["benchmark_nav"] = 1
+        if "hold_nav" in report:
+            initial.update(hold_nav=1, hold_drawdown=0, hold_return_difference=0)
         plotted = pd.concat([pd.DataFrame([initial]), report], ignore_index=True)
-        chart(plotted, {"nav": "策略净值（扣费）", "benchmark_nav": "基准净值"}, "净值走势")
+        chart(plotted, {"nav": "策略净值（扣费）", "hold_nav": hold_label + "（扣费）",
+                        "benchmark_nav": "自选基准净值（未扣费）"}, "净值走势")
         tabs = st.tabs(["回撤与每日收益", "每日持仓", "成交明细", "自定义指标", "运行日志", "源码与参数"])
         with tabs[0]:
-            chart(plotted, {"drawdown": "回撤"}, "回撤", percent=True)
+            chart(plotted, {"drawdown": "策略回撤", "hold_drawdown": "买入持有回撤"}, "回撤对比", percent=True)
+            if "hold_return_difference" in report:
+                chart(plotted, {"hold_return_difference": "策略 − 买入持有"}, "累计收益差（两条净值相减）", percent=True)
             st.dataframe(report, width="stretch", hide_index=True, column_config={**TABLE_LABELS, "cost": "费用比例"})
         for tab, filename, label in [(tabs[1], "holdings", "持仓"), (tabs[2], "trades", "成交"), (tabs[3], "records", "自定义指标")]:
             with tab:
@@ -264,6 +288,15 @@ def run_view(run_id):
                         chart(frame, {c: c for c in frame if c != "datetime"}, "策略记录")
                     st.download_button(f"导出{label} CSV", frame.to_csv(index=False).encode("utf-8-sig"), f"{filename}.csv", mime="text/csv")
         log_container, source_container = tabs[4], tabs[5]
+        if "hold_metrics" in stats:
+            with st.expander("买入持有对照明细"):
+                for filename, label in [("hold_report", "每日账户"), ("hold_trades", "成交"), ("hold_holdings", "持仓")]:
+                    frame = pd.read_parquet(folder / f"{filename}.parquet")
+                    st.caption(label)
+                    st.dataframe(frame, hide_index=True, width="stretch", column_config=TABLE_LABELS)
+                    st.download_button(f"导出对照{label} CSV", frame.to_csv(index=False).encode("utf-8-sig"),
+                                       f"{filename}.csv", mime="text/csv")
+                st.code(stats["hold_source"], language="python")
         st.download_button("导出每日收益 CSV", report.to_csv(index=False).encode("utf-8-sig"), "report.csv", mime="text/csv")
         st.download_button("下载完整回测 ZIP", store.archive(run_id), f"backtest-{run_id[:8]}.zip", mime="application/zip")
     else:
@@ -322,7 +355,7 @@ def history_page():
 def data_page():
     st.title("数据管理")
     st.caption("下载可以持续进行。刷新后，新完成的文件将用于后续回测，已运行的快照保持不变。")
-    st.text_input("Parquet 数据目录", value=os.environ.get("QLIB_WORKBENCH_DATA", str(ROOT / "db/data/market_daily")), key="data_path")
+    st.text_input("Parquet 数据目录", value=os.environ.get("QLIB_WORKBENCH_DATA", str(ROOT / "data/market_daily")), key="data_path")
     refresh = st.button("重新扫描数据", type="primary")
     cat = catalog(refresh=refresh)
     a, b, c = st.columns(3)

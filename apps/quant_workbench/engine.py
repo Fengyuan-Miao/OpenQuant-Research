@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from types import SimpleNamespace
 
 import numpy as np
@@ -183,7 +184,47 @@ class StrategyAdapter(BaseStrategy):
         self.check_cancel()
 
 
+HOLD_SOURCE = '''
+def initialize(context):
+    context.submitted = False
+
+def handle_data(context, data):
+    if not context.submitted:
+        for code in context.universe:
+            order_target_percent(code, 1 / len(context.universe))
+        context.submitted = True
+'''
+
+
 def run_backtest(source, snapshot_dir, config, progress=lambda *a: None, check_cancel=lambda: None):
+    """Compare the strategy with a passive account on exactly the same snapshot."""
+    tables, stats = _run_backtest(source, snapshot_dir, deepcopy(config),
+        lambda value, message: progress(value * 0.8, message), check_cancel)
+    check_cancel()
+    progress(0.8, "正在计算买入持有对照…")
+    logging.getLogger(__name__).info("开始买入持有对照（同资金、同费用、同数据快照）")
+    passive_config = deepcopy(config)
+    passive_config.update(benchmark=None, params={})
+    passive, passive_stats = _run_backtest(HOLD_SOURCE, snapshot_dir, passive_config,
+        lambda value, message: progress(0.8 + value * 0.2, "买入持有对照 · " + message), check_cancel)
+    report = tables["report"].set_index("datetime")
+    hold = passive["report"].set_index("datetime")
+    if not report.index.equals(hold.index):
+        raise ValueError("买入持有对照的交易日期与策略不一致")
+    report["hold_nav"] = hold.nav
+    report["hold_drawdown"] = hold.drawdown
+    report["hold_daily_return"] = hold.daily_return
+    report["hold_return_difference"] = report.nav - hold.nav
+    tables["report"] = report.reset_index()
+    for name in ("report", "trades", "holdings"):
+        tables["hold_" + name] = passive[name]
+    stats["hold_metrics"] = passive_stats
+    stats["hold_return_difference"] = stats["total_return"] - passive_stats["total_return"]
+    stats["hold_source"] = HOLD_SOURCE
+    return tables, stats
+
+
+def _run_backtest(source, snapshot_dir, config, progress=lambda *a: None, check_cancel=lambda: None):
     import qlib
     from qlib.backtest import backtest
     from .metrics import analyze
