@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -26,7 +27,9 @@ class WorkbenchExchange(Exchange):
 class StrategyAdapter(BaseStrategy):
     def __init__(self, source, raw, config, progress=lambda *a: None, check_cancel=lambda: None, calendar=None):
         super().__init__()
-        self.raw = raw.sort_index()
+        self.raw = raw if raw.index.is_monotonic_increasing else raw.sort_index()
+        self._stock_rows = self.raw.groupby(level="instrument", sort=False).indices
+        self._row_dates = self.raw.index.get_level_values("datetime")
         self.config = config
         self.progress = progress
         self.check_cancel = check_cancel
@@ -38,6 +41,7 @@ class StrategyAdapter(BaseStrategy):
         self.log = logging.getLogger("strategy")
         self.context = SimpleNamespace(params=config.get("params", {}), universe=config["symbols"],
                                        current_dt=None, portfolio=None)
+        self.context.trading_costs = {key: config[key] for key in ("open_cost", "close_cost", "min_cost")}
         namespace = {"__name__": "user_strategy", "history": self.history,
                      "order_target_value": self.order_target_value,
                      "order_target_percent": self.order_target_percent,
@@ -64,11 +68,14 @@ class StrategyAdapter(BaseStrategy):
         past = self.dates[self.dates < self.context.current_dt]
         if not len(past):
             return pd.DataFrame(columns=fields, index=pd.MultiIndex.from_arrays([[], []], names=["datetime", "instrument"]))
-        index_dates = self.raw.index.get_level_values("datetime")
-        visible = self.raw[(index_dates <= past[-1]) & self.raw.index.get_level_values("instrument").isin(codes)]
+        # Slice the sorted date index first: daily calls need not scan years of all-market rows.
+        window = past[-count:]
+        columns = list(dict.fromkeys(fields + ["adj_factor"]))
+        visible = self.raw.loc[window[0]:window[-1], columns]
+        visible = visible[visible.index.get_level_values("instrument").isin(codes)]
         cutoff_factors = visible.groupby(level="instrument").adj_factor.last()
         frame = visible[
-            visible.index.get_level_values("datetime").isin(past[-count:])].copy()
+            visible.index.get_level_values("datetime").isin(window)].copy()
         factors = frame.adj_factor / frame.index.get_level_values("instrument").map(cutoff_factors)
         for field in set(fields) & set(PRICE_FIELDS):
             frame[field] *= factors
@@ -101,18 +108,21 @@ class StrategyAdapter(BaseStrategy):
 
     def _latest(self, code, before):
         try:
-            stock = self.raw.xs(code, level="instrument")
-            return stock.loc[stock.index < before].iloc[-1]
-        except (KeyError, IndexError):
+            rows = self._stock_rows[code]
+            offset = self._row_dates.take(rows).searchsorted(before, side="left") - 1
+            return self.raw.iloc[rows[offset]] if offset >= 0 else None
+        except KeyError:
             return None
 
     def _base_factor(self, code):
-        return self.raw.xs(code, level="instrument").adj_factor.iloc[0]
+        return self.raw["adj_factor"].iloc[self._stock_rows[code][0]]
 
     def generate_trade_decision(self, execute_result=None):
         self.check_cancel()
         start, end = self.trade_calendar.get_step_time()
         self.context.current_dt = start.normalize()
+        past_dates = self.dates[self.dates < self.context.current_dt]
+        self.context.previous_dt = past_dates[-1] if len(past_dates) else None
         position = self.trade_position
         positions = {}
         for code in position.get_stock_list():
@@ -131,7 +141,10 @@ class StrategyAdapter(BaseStrategy):
             self.initialize(self.context)
             self.initialized = True
         previous = self.history(1, [f for f in ("open", "high", "low", "close", "volume", "amount") if f in self.raw])
-        data = {code: SimpleNamespace(**row.to_dict()) for (_, code), row in previous.iterrows()}
+        # iterrows builds thousands of Series each day. Use the same homogeneous row
+        # values and Python scalar conversion without creating those temporary objects.
+        data = {index[1]: SimpleNamespace(**dict(zip(previous.columns, row.tolist())))
+                for index, row in zip(previous.index, previous.to_numpy())}
         self.handle_data(self.context, data)
         # Holdings not mentioned by the strategy retain their existing allocation.
         desired_value = sum(self.targets.values()) + sum(p.value for c, p in positions.items() if c not in self.targets)
@@ -196,17 +209,31 @@ def handle_data(context, data):
 '''
 
 
-def run_backtest(source, snapshot_dir, config, progress=lambda *a: None, check_cancel=lambda: None):
+def run_backtest(source, snapshot_dir, config, progress=lambda *a: None, check_cancel=lambda: None,
+                 *, use_comparison_cache=True):
     """Compare the strategy with a passive account on exactly the same snapshot."""
+    from .comparison_cache import cache_identity, load_or_compute
+
+    started = time.perf_counter()
+    prepared = _prepare_backtest(snapshot_dir, config, check_cancel)
+    prepared_at = time.perf_counter()
     tables, stats = _run_backtest(source, snapshot_dir, deepcopy(config),
-        lambda value, message: progress(value * 0.8, message), check_cancel)
+        lambda value, message: progress(value * 0.8, message), check_cancel, prepared=prepared)
+    strategy_at = time.perf_counter()
     check_cancel()
     progress(0.8, "正在计算买入持有对照…")
     logging.getLogger(__name__).info("开始买入持有对照（同资金、同费用、同数据快照）")
     passive_config = deepcopy(config)
     passive_config.update(benchmark=None, params={})
-    passive, passive_stats = _run_backtest(HOLD_SOURCE, snapshot_dir, passive_config,
-        lambda value, message: progress(0.8 + value * 0.2, "买入持有对照 · " + message), check_cancel)
+    key = cache_identity(snapshot_dir, passive_config, HOLD_SOURCE) if use_comparison_cache else None
+    passive, passive_stats, cache_hit = load_or_compute(key, lambda: _run_backtest(
+        HOLD_SOURCE, snapshot_dir, passive_config,
+        lambda value, message: progress(0.8 + value * 0.2, "买入持有对照 · " + message),
+        check_cancel, prepared=prepared), check_cancel)
+    if cache_hit:
+        progress(1., "买入持有对照 · 已复用相同数据与配置的缓存")
+    check_cancel()
+    comparison_at = time.perf_counter()
     report = tables["report"].set_index("datetime")
     hold = passive["report"].set_index("datetime")
     if not report.index.equals(hold.index):
@@ -219,29 +246,51 @@ def run_backtest(source, snapshot_dir, config, progress=lambda *a: None, check_c
     for name in ("report", "trades", "holdings"):
         tables["hold_" + name] = passive[name]
     stats["hold_metrics"] = passive_stats
+    stats["hold_filled_orders"] = (int(passive["trades"].amount.gt(0).sum())
+                                    if "amount" in passive["trades"] else 0)
     stats["hold_return_difference"] = stats["total_return"] - passive_stats["total_return"]
     stats["hold_source"] = HOLD_SOURCE
+    stats["timings"] = dict(prepare_seconds=prepared_at - started,
+        strategy_seconds=strategy_at - prepared_at, comparison_seconds=comparison_at - strategy_at,
+        comparison_cache_hit=cache_hit, total_seconds=time.perf_counter() - started)
+    logging.getLogger(__name__).info("回测阶段耗时：%s", stats["timings"])
     return tables, stats
 
 
-def _run_backtest(source, snapshot_dir, config, progress=lambda *a: None, check_cancel=lambda: None):
+def _prepare_backtest(snapshot_dir, config, check_cancel):
+    """Load immutable inputs once. Each account receives an independent executor/exchange."""
     import qlib
-    from qlib.backtest import backtest
-    from .metrics import analyze
 
+    check_cancel()
     raw = pd.read_parquet(snapshot_dir / "raw.parquet")
+    if not raw.index.is_monotonic_increasing:
+        raw = raw.sort_index()
     qlib.init(provider_uri=str(snapshot_dir / "provider"), region="cn", kernels=1,
               expression_cache=None, dataset_cache=None)
     calendar = pd.to_datetime((snapshot_dir / "provider/calendars/day.txt").read_text().splitlines())
-    strategy = StrategyAdapter(source, raw, config, progress, check_cancel, calendar)
-    # Qlib's None benchmark becomes its default CSI300 in create_account_instance.
-    # Supply an explicit zero series; compute an optional user benchmark ourselves.
-    benchmark_zero = pd.Series(0.0, index=strategy.dates)
+    check_cancel()
     exchange = WorkbenchExchange(freq="day", start_time=config["start"], end_time=config["end"],
                                  codes=config["symbols"], deal_price="$open",
                                  limit_threshold=("$paused", "$paused"), trade_unit=100,
                                  open_cost=config["open_cost"], close_cost=config["close_cost"],
                                  min_cost=config["min_cost"])
+    check_cancel()
+    return raw, calendar, exchange
+
+
+def _run_backtest(source, snapshot_dir, config, progress=lambda *a: None, check_cancel=lambda: None,
+                  *, prepared=None):
+    from qlib.backtest import backtest
+    from .metrics import analyze
+
+    raw, calendar, template_exchange = prepared or _prepare_backtest(snapshot_dir, config, check_cancel)
+    # Copy the pristine loaded exchange, including its quote arrays. Runtime mutations
+    # of one account cannot affect the other; no orders or positions are shared.
+    exchange = deepcopy(template_exchange)
+    strategy = StrategyAdapter(source, raw, config, progress, check_cancel, calendar)
+    # Qlib's None benchmark becomes its default CSI300 in create_account_instance.
+    benchmark_zero = pd.Series(0.0, index=strategy.dates)
+    check_cancel()
     portfolio, _ = backtest(start_time=config["start"], end_time=config["end"], strategy=strategy,
         executor={"class": "SimulatorExecutor", "module_path": "qlib.backtest.executor",
                   "kwargs": {"time_per_step": "day", "generate_portfolio_metrics": True}},
@@ -259,4 +308,6 @@ def _run_backtest(source, snapshot_dir, config, progress=lambda *a: None, check_
               "records": pd.DataFrame(strategy.records)}
     if not tables["records"].empty:
         tables["records"] = tables["records"].groupby("datetime", as_index=False).last()
+    if hasattr(strategy.context, "rebalance_plans"):
+        tables["rebalance_plan"] = pd.DataFrame(strategy.context.rebalance_plans)
     return tables, stats

@@ -9,6 +9,7 @@ TEMPLATE_FILES = {
     "短期反转": "reversal.py",
     "布林带均值回归": "bollinger.py",
     "唐奇安通道突破": "donchian.py",
+    "A股中期动量基线": "stock_momentum_base.py",
 }
 TEMPLATES = {name: (STRATEGY_DIR / file).read_text(encoding="utf-8")
              for name, file in TEMPLATE_FILES.items()}
@@ -20,6 +21,7 @@ TEMPLATE_LESSONS = {
     "短期反转": "第 4 课：定期买过去收益最低的股票。与动量比较排名方向；持续下跌时反转可能不出现。",
     "布林带均值回归": "第 5 课：教学规则为跌破下轨持有、回到中轨退出。学习标准差和状态；下轨不保证反弹。",
     "唐奇安通道突破": "第 6 课：突破此前最高价持有、跌破此前最低价退出。学习窗口排除当前观察值；不包含完整海龟系统。",
+    "A股中期动量基线": "小资金研究：请将初始资金设为10000元。月初调仓，最多3只、旧仓前5保留，总仓位80%、单股30%；整数手预算、小额调整过滤，结果可导出调仓计划。需至少252个历史交易日；未知行业上限80%不代表行业分散，研究模式不能核实缺失的历史ST状态。股票池由你指定。",
 }
 
 API_HELP = '''
@@ -30,8 +32,10 @@ def handle_data(context, data): ... # 每日开盘前调用
 ```
 `context.current_dt` 是当前交易日；`context.params` 是参数字典，
 `context.universe` 是标准化股票代码列表。
+`context.previous_dt` 是本地数据日历中的上一交易日（没有时为 None），可用于判断月初；它不依赖个股是否缺行情。
 `context.portfolio` 包含 `cash`、`available_cash`、`total_value`、`positions`。
 持仓对象包含 `total_amount`（实际股数）、`price` 和 `value`。
+`context.trading_costs` 提供本次回测的 `open_cost`、`close_cost`、`min_cost`，供策略预估费用，不代表券商真实收费。
 
 `data[股票代码].close` 等字段仅来自**上一交易日**；该日缺行情的股票不在 data 中。
 

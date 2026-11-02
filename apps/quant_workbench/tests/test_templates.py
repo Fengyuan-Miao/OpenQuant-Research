@@ -51,7 +51,7 @@ def prepare(market, tmp_path, cfg):
     return snapshot(manifest, tmp_path / "snapshots"), cfg, manifest
 
 
-@pytest.mark.parametrize("name", list(TEMPLATES))
+@pytest.mark.parametrize("name", [name for name in TEMPLATES if name != "A股中期动量基线"])
 def test_teaching_templates_with_actual_qlib(name, market, tmp_path):
     """Rising/falling stocks and a crash/recovery exercise actual fills, not just syntax."""
     from apps.quant_workbench.engine import run_backtest
@@ -131,16 +131,24 @@ def test_templates_reject_invalid_risk(name):
         template_harness(name, {"risk": 1.1})
 
 
-def test_teaching_template_selection_in_ui(tmp_path, monkeypatch):
+def test_teaching_template_selection_in_ui(tmp_path, monkeypatch, market):
     from streamlit.testing.v1 import AppTest
 
     monkeypatch.setenv("QLIB_WORKBENCH_HOME", str(tmp_path / "teaching_ui"))
+    monkeypatch.setenv("QLIB_WORKBENCH_DATA", str(market[0]))
     app = AppTest.from_file(str(Path("apps/quant_workbench/app.py").resolve()), default_timeout=30).run()
     selector = next(s for s in app.selectbox if s.label == "策略模板")
     assert selector.options == list(TEMPLATES)
     selector.select("唐奇安通道突破").run()
     assert not app.exception
     assert "第 6 课" in app.info[0].value
+    selector = next(s for s in app.selectbox if s.label == "策略模板")
+    selector.select("A股中期动量基线").run()
+    assert not app.exception
+    assert "252" in app.info[0].value
+    next(button for button in app.button if button.label == "创建并编辑").click().run()
+    assert not app.exception
+    assert next(field for field in app.number_input if field.label == "初始资金（元）").value == 10000
 
 
 @pytest.mark.parametrize("symbols,expected", [(["SZ000001"], 10891.), (["SZ000001", "SH600000"], 10790.)])
@@ -228,7 +236,13 @@ def test_passive_results_ui_export_and_legacy(market, tmp_path, monkeypatch):
     assert not app.exception
     assert any(m.label == "标的买入持有收益" for m in app.metric)
     assert any(m.label == "策略 − 买入持有" for m in app.metric)
-    assert len(app.get("plotly_chart")) == 3
+    assert len(app.get("plotly_chart")) == 1  # linked performance/risk panels
+    next(r for r in app.radio if r.label == "下方图表").set_value("累计收益差").run()
+    assert not app.exception
+    next(t for t in app.toggle if t.label == "显示净值").set_value(True).run()
+    assert not app.exception
+    next(r for r in app.radio if r.label == "下方图表").set_value("每日收益").run()
+    assert not app.exception
     assert any("基准收益" in c.value for c in app.caption)
     # Historical results created before the feature remain viewable.
     folder = store.directory(run_id)

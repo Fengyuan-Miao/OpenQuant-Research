@@ -138,7 +138,8 @@ class Store:
                     process = subprocess.Popen([sys.executable, "-u", "-m", "apps.quant_workbench.worker",
                                                 str(self.root), run_id], cwd=PROJECT,
                                                stdout=output, stderr=subprocess.STDOUT,
-                                               start_new_session=True)
+                                               start_new_session=True,
+                                               env={**os.environ, "PYTHONHASHSEED": os.environ.get("PYTHONHASHSEED", "0")})
                 _CHILDREN[run_id] = process
                 self.update(run_id, pid=process.pid, process_start=psutil.Process(process.pid).create_time())
             except Exception:

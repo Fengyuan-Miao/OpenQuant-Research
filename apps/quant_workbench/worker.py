@@ -2,6 +2,7 @@
 import json
 import logging
 import sys
+import time
 import traceback
 
 from .data import snapshot
@@ -23,11 +24,13 @@ def main(root, run_id):
         check_cancel()
         store.update(run_id, progress=value, message=message)
     try:
+        started = time.perf_counter()
         check_cancel()
         manifest = json.loads((folder / "manifest.json").read_text())
         config = json.loads((folder / "config.json").read_text())
         store.update(run_id, message="正在准备固定数据快照…")
         data_dir = snapshot(manifest, store.root / "snapshots", check_cancel)
+        snapshot_seconds = time.perf_counter() - started
         check_cancel()
         from .engine import run_backtest
         store.update(run_id, status="running", message="开始 Qlib 回测")
@@ -35,6 +38,10 @@ def main(root, run_id):
         check_cancel()
         for name, frame in tables.items():
             frame.to_parquet(folder / f"{name}.parquet", index=False)
+        metrics["timings"].update(snapshot_seconds=snapshot_seconds,
+                                  worker_seconds=time.perf_counter() - started)
+        logging.info("任务总耗时 %.2f 秒（数据快照 %.2f 秒）",
+                     metrics["timings"]["worker_seconds"], snapshot_seconds)
         (folder / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, allow_nan=False))
         check_cancel()
         store.update(run_id, status="success", progress=1, message="回测完成")

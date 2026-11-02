@@ -30,10 +30,15 @@ def symbol(value: str) -> str:
     return {"XSHG": "SH", "XSHE": "SZ", "XBSE": "BJ"}.get(exchange, exchange) + code
 
 
-def scan(directory: str | Path) -> dict:
+def scan(directory: str | Path, *, start=None, end=None) -> dict:
     directory = Path(directory).expanduser().resolve()
+    first = pd.Timestamp(start).strftime("%Y%m%d") if start is not None else None
+    last = pd.Timestamp(end).strftime("%Y%m%d") if end is not None else None
     files, errors, securities = [], [], set()
+    normalized = {}
     for path in sorted(directory.glob("*.parquet")):
+        if (first is not None and path.stem < first) or (last is not None and path.stem > last):
+            continue
         try:
             date = pd.to_datetime(path.stem, format="%Y%m%d").strftime("%Y-%m-%d")
             before = path.stat()
@@ -44,7 +49,10 @@ def scan(directory: str | Path) -> dict:
             after = path.stat()
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 raise ValueError("文件正在写入")
-            securities.update(symbol(x) for x in table.column(0).unique().to_pylist())
+            for code in table.column(0).unique().to_pylist():
+                if code not in normalized:
+                    normalized[code] = symbol(code)
+                securities.add(normalized[code])
             files.append({"path": str(path), "date": date, "size": after.st_size, "mtime": after.st_mtime_ns})
         except Exception as exc:
             errors.append({"文件": path.name, "原因": str(exc)})
@@ -58,7 +66,31 @@ def scan(directory: str | Path) -> dict:
             "symbols": sorted(securities), "segments": segments}
 
 
-def freeze_manifest(catalog: dict, start: str, end: str, codes: list[str]) -> dict:
+def local_a_universe(catalog: dict, start) -> dict:
+    """Fixed pool observed strictly before the backtest start, never today's survivors."""
+    start = pd.Timestamp(start).strftime("%Y-%m-%d")
+    eligible = [entry for entry in catalog["files"] if entry["date"] < start]
+    if not eligible:
+        raise ValueError("回测开始前没有完整行情日，无法生成股票池")
+    entry = max(eligible, key=lambda item: item["date"])
+    path = Path(entry["path"])
+    before = path.stat()
+    content = path.read_bytes()
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise ValueError(f"{path.name} 正在写入，请刷新后重试")
+    frame = pd.read_parquet(io.BytesIO(content), columns=["ts_code", "trade_date"])
+    if not (pd.to_datetime(frame.trade_date.astype(str), format="%Y%m%d") == pd.Timestamp(entry["date"])).all():
+        raise ValueError(f"股票池文件日期不符：{path.name}")
+    # The local daily directory can also contain user-added ETF/index/B-share files.
+    codes = sorted({symbol(code) for code in frame.ts_code
+                    if re.fullmatch(r"(?:SH(?:60|68)\d{4}|SZ(?:00|30)\d{4}|BJ\d{6})", symbol(code))})
+    if not codes:
+        raise ValueError("起点前行情日没有可识别的 A 股代码")
+    return {"symbols": codes, "asof": entry["date"], "sha256": hashlib.sha256(content).hexdigest()}
+
+
+def freeze_manifest(catalog: dict, start: str, end: str, codes: list[str], *, history_days=None) -> dict:
     start, end = str(start), str(end)
     if start > end:
         raise ValueError("开始日期不能晚于结束日期")
@@ -68,12 +100,16 @@ def freeze_manifest(catalog: dict, start: str, end: str, codes: list[str]) -> di
     run_dates = [d for d in segment if start <= d <= end]
     if not run_dates or not any(d < run_dates[0] for d in segment):
         raise ValueError("回测至少需要一个交易日及一个更早的行情日")
+    if history_days is not None and (isinstance(history_days, bool) or not isinstance(history_days, int) or history_days < 1):
+        raise ValueError("预读历史交易日必须为正整数，或留空读取全部历史")
+    history = [d for d in segment if d < run_dates[0]]
+    first = history[-history_days:][0] if history_days is not None else segment[0]
     codes = sorted(set(symbol(s) for s in codes))
     if not codes or set(codes) - set(catalog["symbols"]):
         raise ValueError("股票池为空或包含数据目录中不存在的股票")
     entries = []
     for item in catalog["files"]:
-        if segment[0] <= item["date"] <= end:
+        if first <= item["date"] <= end:
             path = Path(item["path"])
             before = path.stat()
             content = path.read_bytes()
